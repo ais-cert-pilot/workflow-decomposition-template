@@ -15,15 +15,16 @@ submit.sh — one-command student submission for the AIS certification grader.
 What it does:
   1. Runs preflight checks (git config, origin remote, attached HEAD).
   2. Verifies deliverables/process-map.md exists.
-  3. Locates the newest Claude Code session log for this repo under
+  3. Locates ALL Claude Code session logs for this repo under
      ~/.claude/projects/<mangled-cwd>/*.jsonl.
-  4. Copies it to deliverables/session-log.jsonl.
+  4. Concatenates them chronologically (oldest first) into
+     deliverables/session-log.jsonl.
   5. Commits only those two paths, tags submit-v1 (force-moves on
      re-submission), and pushes branch + tag to origin. The tag push
      triggers the grading workflow.
 
 Flags:
-  --dry-run   Preflight + locate + copy only. No commit, tag, or push.
+  --dry-run   Preflight + locate + concatenate only. No commit, tag, or push.
   -h, --help  Show this message.
 
 Tool support: Claude Code only (per POC spec). Codex/Aider are v1.
@@ -48,16 +49,41 @@ err() { printf '%s\n' "$*" >&2; }
 # Helpers (portable: Python 3 is already a hard dep for this course).
 # ---------------------------------------------------------------------------
 
-# Print newest *.jsonl (by mtime) in a directory, or exit non-zero if none.
-newest_jsonl() {
+# Concatenate ALL *.jsonl files in a directory to stdout, in chronological
+# order (oldest mtime first, newest last). Exit non-zero if no files found.
+# If a file doesn't end with a newline, emit one before the next file so
+# JSON-lines records don't merge across session boundaries.
+concatenate_all_jsonl() {
     python3 - "$1" <<'PY'
 import os, sys, glob
 d = sys.argv[1]
 files = [f for f in glob.glob(os.path.join(d, "*.jsonl")) if os.path.isfile(f)]
 if not files:
     sys.exit(1)
-files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
-print(files[0])
+files.sort(key=lambda f: os.path.getmtime(f))  # oldest first
+out = sys.stdout.buffer
+for f in files:
+    with open(f, "rb") as fh:
+        data = fh.read()
+    if not data:
+        continue
+    out.write(data)
+    if not data.endswith(b"\n"):
+        out.write(b"\n")
+PY
+}
+
+# Count *.jsonl files and total bytes in a directory (for reporting).
+# Prints "<count> <total_bytes>" to stdout, or exits non-zero if none.
+count_and_size_jsonl() {
+    python3 - "$1" <<'PY'
+import os, sys, glob
+d = sys.argv[1]
+files = [f for f in glob.glob(os.path.join(d, "*.jsonl")) if os.path.isfile(f)]
+if not files:
+    sys.exit(1)
+total = sum(os.path.getsize(f) for f in files)
+print(f"{len(files)} {total}")
 PY
 }
 
@@ -208,32 +234,21 @@ if [[ -z "$SESSION_DIR" ]]; then
     exit 1
 fi
 
-if ! SOURCE_JSONL="$(newest_jsonl "$SESSION_DIR")" || [[ -z "$SOURCE_JSONL" || ! -f "$SOURCE_JSONL" ]]; then
+if ! COUNT_AND_SIZE="$(count_and_size_jsonl "$SESSION_DIR")"; then
     err "Found session directory ($SESSION_DIR) but no *.jsonl files inside it."
     err "Has this repo had a Claude Code session yet?"
     exit 1
 fi
+JSONL_COUNT="${COUNT_AND_SIZE% *}"
+JSONL_TOTAL_BYTES="${COUNT_AND_SIZE##* }"
 
 # ---------------------------------------------------------------------------
-# 3. Copy the session log.
+# 3. Concatenate the session logs.
 # ---------------------------------------------------------------------------
 
 DEST="deliverables/session-log.jsonl"
 
-# Validate the SOURCE before touching DEST — a zero-byte (or missing) source
-# must not clobber a prior good session-log.jsonl.
-SIZE_BYTES="$(file_size_bytes "$SOURCE_JSONL")"
-if [[ "$SIZE_BYTES" -eq 0 ]]; then
-    err "The newest session log is 0 bytes:"
-    err "  $SOURCE_JSONL"
-    err "Did you just open the project in Claude Code without doing any work?"
-    err "Do at least one Claude Code turn in this repo before submitting."
-    err "(If this file is a stale empty log, delete or rename it and re-run.)"
-    err "Leaving $DEST unchanged."
-    exit 1
-fi
-
-SIZE_KB=$(( SIZE_BYTES / 1024 ))
+SIZE_KB=$(( JSONL_TOTAL_BYTES / 1024 ))
 
 # ---------------------------------------------------------------------------
 # 4. Detect re-submission (local OR remote tag).
@@ -252,10 +267,10 @@ else
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    err "(dry-run) would copy ${SIZE_KB} KB from ${SOURCE_JSONL} -> ${DEST}"
-    err "[--dry-run] Stopping before copy/commit/tag/push. No local state mutated."
+    err "(dry-run) would concatenate ${JSONL_COUNT} session log file(s) (total ${SIZE_KB} KB) from ${SESSION_DIR} -> ${DEST}"
+    err "[--dry-run] Stopping before concat/commit/tag/push. No local state mutated."
     err "[--dry-run] Would run:"
-    err "  cp \"$SOURCE_JSONL\" \"$DEST\""
+    err "  concatenate_all_jsonl \"$SESSION_DIR\" > \"$DEST\""
     err "  git add -- \"$DEST\" deliverables/process-map.md"
     err "  git commit -m 'Submit v1' -- \"$DEST\" deliverables/process-map.md   # (if staged diff non-empty)"
     if [[ "$RESUBMIT" -eq 1 ]]; then
@@ -268,15 +283,27 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
 fi
 
-# Atomic copy: write to a tmp file alongside DEST, then mv into place so an
-# interrupted cp can never leave DEST half-written.
+# Atomic write: concatenate to a tmp file alongside DEST, then mv into place
+# so an interrupted write can never leave DEST half-written.
 TMP_DEST="$(mktemp "deliverables/session-log.jsonl.XXXXXX.tmp")"
 trap 'rm -f "$TMP_DEST" 2>/dev/null || true' EXIT
 
-if ! cp "$SOURCE_JSONL" "$TMP_DEST"; then
-    err "Failed to copy session log to a temp file in deliverables/."
-    err "  source: $SOURCE_JSONL"
+if ! concatenate_all_jsonl "$SESSION_DIR" > "$TMP_DEST"; then
+    err "Failed to concatenate session logs from $SESSION_DIR into a temp file."
     err "Check disk space and permissions, then re-run ./submit.sh."
+    exit 1
+fi
+
+# Zero-byte check AFTER concatenation — if all sessions were empty, don't
+# clobber a prior good session-log.jsonl.
+CONCAT_BYTES="$(file_size_bytes "$TMP_DEST")"
+if [[ "$CONCAT_BYTES" -eq 0 ]]; then
+    err "Concatenated session log is 0 bytes:"
+    err "  source dir: $SESSION_DIR"
+    err "Did you just open the project in Claude Code without doing any work?"
+    err "Do at least one Claude Code turn in this repo before submitting."
+    err "(If the logs under that dir are all stale/empty, delete them and re-run.)"
+    err "Leaving $DEST unchanged."
     exit 1
 fi
 
@@ -286,8 +313,8 @@ if ! mv "$TMP_DEST" "$DEST"; then
     exit 1
 fi
 
-err "Copied session log (${SIZE_KB} KB) to ${DEST}"
-err "  source: $SOURCE_JSONL"
+err "Concatenated ${JSONL_COUNT} session log file(s) (${SIZE_KB} KB) to ${DEST}"
+err "  source dir: $SESSION_DIR"
 
 # ---------------------------------------------------------------------------
 # 5. Commit + tag + push (scoped strictly to our two paths).
