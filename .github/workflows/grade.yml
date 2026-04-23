@@ -1,0 +1,299 @@
+name: AIS Cert Grader v1
+
+on:
+  push:
+    tags:
+      - 'submit-v1'
+
+permissions:
+  checks: write
+  contents: read
+
+jobs:
+  grade:
+    name: grade
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install grader dependencies
+        id: install
+        run: |
+          set -euo pipefail
+          # Rely on the pip shipped with actions/setup-python@v5.6.0 — no
+          # self-upgrade (POC-minimalism + keeps the step inside the timeout).
+          #
+          # Wrap pip install with a shell-level timeout so a stalled network
+          # connection cannot eat the job budget. On failure we capture pip's
+          # stderr, publish a synthetic exit_code (12=timeout, 13=other), and
+          # exit 0 so the reporting step still produces a Check Run with the
+          # real pip output rather than a generic "unexpected code" message.
+          STDERR_FILE=$(mktemp "${RUNNER_TEMP:-/tmp}/pip.stderr.XXXXXX")
+          echo "STDERR_FILE=${STDERR_FILE}" >> "$GITHUB_ENV"
+          set +e
+          timeout 180 pip install -r grader/requirements.txt 2> >(tee "$STDERR_FILE" 1>&2)
+          pip_rc=$?
+          set -e
+          if [ "$pip_rc" -eq 0 ]; then
+            # Clear STDERR_FILE so the grader step allocates its own.
+            : > "$STDERR_FILE"
+            exit 0
+          fi
+          if [ "$pip_rc" -eq 124 ]; then
+            echo "pip install timed out after 180s (network hang)" 1>&2
+            echo "exit_code=12" >> "$GITHUB_OUTPUT"
+          else
+            echo "pip install failed (exit ${pip_rc})" 1>&2
+            echo "exit_code=13" >> "$GITHUB_OUTPUT"
+          fi
+          # exit 0 so the reporting step runs with a clean Check Run.
+          exit 0
+
+      - name: Run grader
+        id: grade
+        if: steps.install.outputs.exit_code == ''
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RUBRIC: ${{ secrets.RUBRIC_V1 }}
+        run: |
+          set -euo pipefail
+
+          # Allocate unique temp files under $RUNNER_TEMP so concurrent or
+          # retried runs cannot clobber each other. Export paths so the
+          # reporting step can locate them.
+          STDOUT_FILE=$(mktemp "${RUNNER_TEMP:-/tmp}/grader.stdout.XXXXXX")
+          STDERR_FILE=$(mktemp "${RUNNER_TEMP:-/tmp}/grader.stderr.XXXXXX")
+          echo "STDOUT_FILE=${STDOUT_FILE}" >> "$GITHUB_ENV"
+          echo "STDERR_FILE=${STDERR_FILE}" >> "$GITHUB_ENV"
+
+          # Fail fast with a clear Check Run if the student never submitted the
+          # session log (submit.sh is expected to copy it into deliverables/).
+          if [ ! -f deliverables/process-map.md ]; then
+            echo "missing deliverables/process-map.md" > "$STDERR_FILE"
+            : > "$STDOUT_FILE"
+            echo "exit_code=10" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -f deliverables/session-log.jsonl ]; then
+            echo "missing deliverables/session-log.jsonl" > "$STDERR_FILE"
+            : > "$STDOUT_FILE"
+            echo "exit_code=11" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Capture stdout and stderr separately. Never echo env vars.
+          # Wrap with `timeout` at the shell level so we keep control of the
+          # exit code; 124 means the grader was killed for running too long.
+          # The job-level timeout-minutes: 12 still backstops the whole job.
+          set +e
+          timeout 450 python grader/grader.py \
+            --deliverable deliverables/process-map.md \
+            --session-log deliverables/session-log.jsonl \
+            >"$STDOUT_FILE" 2>"$STDERR_FILE"
+          rc=$?
+          set -e
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          # Always succeed this step so the Check Run step runs and records a
+          # verdict on the commit even when the grader crashed.
+          exit 0
+
+      - name: Post Check Run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Prefer the install step's synthetic exit_code (12/13) when set;
+          # otherwise fall back to the grader's rc. Both steps write to the
+          # same reporting surface.
+          EXIT_CODE: ${{ steps.install.outputs.exit_code || steps.grade.outputs.exit_code }}
+          HEAD_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # STDOUT_FILE / STDERR_FILE come from $GITHUB_ENV (set by the
+          # previous step). If the grader step never ran (e.g. dependency
+          # install failed), fall back to empty paths so the reporting path
+          # still produces a Check Run.
+          STDOUT_FILE="${STDOUT_FILE:-}"
+          STDERR_FILE="${STDERR_FILE:-}"
+          if [ -z "$STDOUT_FILE" ] || [ ! -f "$STDOUT_FILE" ]; then
+            STDOUT_FILE=$(mktemp "${RUNNER_TEMP:-/tmp}/grader.stdout.XXXXXX")
+          fi
+          if [ -z "$STDERR_FILE" ] || [ ! -f "$STDERR_FILE" ]; then
+            STDERR_FILE=$(mktemp "${RUNNER_TEMP:-/tmp}/grader.stderr.XXXXXX")
+          fi
+
+          NAME="AIS Cert Grader v1"
+          CONCLUSION="failure"
+          TITLE="Grading failed"
+          SUMMARY="Grader did not produce a verdict."
+          TEXT=""
+
+          # Map grader exit codes to a human-readable failure class. Codes come
+          # from grader/grader.py (2=env missing, 3=malformed model response,
+          # 4=rubric parse, 5=oversize deliverable, 6=file/decode/symlink,
+          # 7=OpenRouter API failure). 10/11 are workflow-level missing-file
+          # sentinels set by the grader step. 12/13 are install-phase sentinels
+          # set by the install step. 124 is the shell `timeout` exit code when
+          # the grader ran too long.
+          case "${EXIT_CODE}" in
+            "0")   FAILCLASS="" ;;
+            "2")   FAILCLASS="Environment misconfiguration (missing secret)." ;;
+            "3")   FAILCLASS="Model returned a malformed response." ;;
+            "4")   FAILCLASS="Rubric parse error (server-side config issue)." ;;
+            "5")   FAILCLASS="Deliverable exceeds size limit (1 MB)." ;;
+            "6")   FAILCLASS="File read / decode / symlink rejection." ;;
+            "7")   FAILCLASS="OpenRouter API call failed." ;;
+            "10")  FAILCLASS="Missing deliverables/process-map.md at repo root." ;;
+            "11")  FAILCLASS="Missing deliverables/session-log.jsonl at repo root. Did you run ./submit.sh?" ;;
+            "12")  FAILCLASS="Dependency install timed out (>180s)." ;;
+            "13")  FAILCLASS="Dependency install failed — check pip output below." ;;
+            "124") FAILCLASS="Grader timed out (exceeded 450s wall clock)." ;;
+            *)     FAILCLASS="Grader exited with unexpected code ${EXIT_CODE}." ;;
+          esac
+
+          # Shape-validate the grader JSON strictly before trusting it. Any
+          # mismatch falls through to the malformed-output failure path
+          # (same surface as grader exit 3).
+          SCHEMA_OK=0
+          if [ "${EXIT_CODE}" = "0" ] && [ -s "$STDOUT_FILE" ]; then
+            if jq -e '
+                  type == "object"
+                  and ((keys_unsorted | sort) == ["items","pass","score","total"])
+                  and (.pass  | type == "boolean")
+                  and (.score | (type == "number") and (. == (. | floor)))
+                  and (.total | (type == "number") and (. == (. | floor)))
+                  and (.total == 8)
+                  and (.score >= 0)
+                  and (.score <= .total)
+                  and (.items | type == "array")
+                  and (.items | length == 8)
+                  and (.items | all(
+                       type == "object"
+                       and ((keys_unsorted | sort) == ["id","pass","question","reasoning"])
+                       and (.id        | (type == "number") and (. == (. | floor)) and . >= 1 and . <= 8)
+                       and (.question  | (type == "string") and test("\\S"))
+                       and (.reasoning | (type == "string") and test("\\S"))
+                       and (.pass      | type == "boolean")
+                  ))
+                  and ((.items | map(.id) | sort) == [1,2,3,4,5,6,7,8])
+                  and (.score == ([.items[] | select(.pass == true)] | length))
+                  and (.pass == (.score >= 6))
+                ' "$STDOUT_FILE" >/dev/null 2>&1; then
+              SCHEMA_OK=1
+            fi
+          fi
+
+          if [ "$SCHEMA_OK" = "1" ]; then
+            PASS=$(jq -r '.pass'  "$STDOUT_FILE")
+            SCORE=$(jq -r '.score' "$STDOUT_FILE")
+            TOTAL=$(jq -r '.total' "$STDOUT_FILE")
+            # Truncate each reasoning to 600 chars before rendering.
+            ITEMS_MD=$(jq -r '
+                (.items // [])
+                | map(
+                    "### Item \(.id): \(.question)\n\n"
+                    + "- Pass: **\(.pass)**\n"
+                    + "- Reasoning: "
+                    + (if (.reasoning | length) > 600
+                         then (.reasoning[0:600] + " …[truncated]")
+                         else .reasoning
+                       end)
+                    + "\n"
+                  )
+                | join("\n")
+              ' "$STDOUT_FILE")
+            if [ "$PASS" = "true" ]; then
+              CONCLUSION="success"
+              VERDICT="pass"
+            else
+              CONCLUSION="failure"
+              VERDICT="fail"
+            fi
+            TITLE="Score: ${SCORE}/${TOTAL} — ${VERDICT}"
+            SUMMARY="${SCORE}/${TOTAL} — ${VERDICT}"
+            if [ -z "$ITEMS_MD" ]; then
+              TEXT="_(grader returned zero rubric items)_"
+            else
+              TEXT="$ITEMS_MD"
+            fi
+          elif [ "${EXIT_CODE}" = "0" ]; then
+            # Grader exited 0 but stdout did not match the expected schema;
+            # reuse the malformed-output failure surface.
+            CONCLUSION="failure"
+            TITLE="Grading failed"
+            SUMMARY="Grader output could not be parsed as the expected JSON shape."
+            # UTF-8-safe tail of stderr. Explicit encoding + errors="replace"
+            # so a non-UTF-8 traceback still surfaces (with replacement chars)
+            # instead of being swallowed by the `|| true` fallback.
+            # Defense-in-depth: scrub sk-* tokens at the workflow trust
+            # boundary (grader.py already scrubs its own exception messages,
+            # but a crash in a lower layer could surface secrets via a
+            # traceback). Cap tightened to 1000 chars — tracebacks end with
+            # the exception message, so the tail is what matters.
+            ERR_EXCERPT=$(python3 -c 'import re, sys; s=open(sys.argv[1], encoding="utf-8", errors="replace").read(); s=re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "sk-<redacted>", s); print(s if len(s) <= 1000 else "…"+s[-1000:])' "$STDERR_FILE" 2>/dev/null || true)
+            TEXT=$(printf '```\n%s\n```\n' "$ERR_EXCERPT")
+          else
+            CONCLUSION="failure"
+            TITLE="Grading failed"
+            SUMMARY="${FAILCLASS}"
+            ERR_EXCERPT=$(python3 -c 'import re, sys; s=open(sys.argv[1], encoding="utf-8", errors="replace").read(); s=re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "sk-<redacted>", s); print(s if len(s) <= 1000 else "…"+s[-1000:])' "$STDERR_FILE" 2>/dev/null || true)
+            TEXT=$(printf '```\n%s\n```\n' "$ERR_EXCERPT")
+          fi
+
+          # Size caps: belt-and-braces well below GitHub's Check Run limits,
+          # leaving headroom for JSON escaping. Use python3 to slice by
+          # codepoints so we never split a multibyte UTF-8 sequence.
+          # Explicit UTF-8 + errors="replace" belt-and-braces against any
+          # non-UTF-8 content that slipped through from stderr excerpts.
+          SUMMARY=$(python3 -c 'import sys; s=open(0, encoding="utf-8", errors="replace").read().rstrip("\n"); sys.stdout.write(s if len(s) <= 1000 else s[:1000])' <<<"$SUMMARY")
+          TEXT=$(python3 -c 'import sys; s=open(0, encoding="utf-8", errors="replace").read().rstrip("\n"); sys.stdout.write(s if len(s) <= 60000 else s[:60000] + "\n…[output truncated]")' <<<"$TEXT")
+
+          # Build the JSON payload with jq so strings are safely escaped.
+          PAYLOAD=$(jq -n \
+            --arg name "$NAME" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg conclusion "$CONCLUSION" \
+            --arg title "$TITLE" \
+            --arg summary "$SUMMARY" \
+            --arg text "$TEXT" \
+            '{name: $name, head_sha: $head_sha, status: "completed",
+              conclusion: $conclusion,
+              output: {title: $title, summary: $summary, text: $text}}')
+
+          # Post the Check Run. If gh api fails, sleep briefly and retry
+          # ONCE to ride out transient GitHub API blips. Response body is
+          # discarded (it echoes the full Check Run payload, including the
+          # model output text) — stderr is left visible for diagnosis.
+          # If both attempts fail, fail the step so the Actions run is red.
+          set +e
+          printf '%s' "$PAYLOAD" \
+            | gh api --method POST \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${REPO}/check-runs" \
+                --input - >/dev/null
+          gh_rc=$?
+          if [ "$gh_rc" -ne 0 ]; then
+            echo "gh api POST /repos/${REPO}/check-runs failed (exit ${gh_rc}); retrying in 3s" 1>&2
+            sleep 3
+            printf '%s' "$PAYLOAD" \
+              | gh api --method POST \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/${REPO}/check-runs" \
+                  --input - >/dev/null
+            gh_rc=$?
+          fi
+          set -e
+          if [ "$gh_rc" -ne 0 ]; then
+            echo "gh api POST /repos/${REPO}/check-runs failed after retry (exit ${gh_rc})" 1>&2
+            exit 1
+          fi
