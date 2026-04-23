@@ -90,6 +90,18 @@ jobs:
             exit 0
           fi
 
+          # Pre-check deliverable size. If the file is under 500 bytes, the
+          # student has effectively submitted nothing — skip the grader call
+          # (saves a model round-trip + surfaces a clearer failure).
+          # stat -c %s is GNU stat; Ubuntu runners are Linux so this is portable.
+          DELIV_SIZE=$(stat -c %s deliverables/process-map.md)
+          if [ "$DELIV_SIZE" -lt 500 ]; then
+            echo "deliverables/process-map.md is ${DELIV_SIZE} bytes (<500); nothing to grade" > "$STDERR_FILE"
+            : > "$STDOUT_FILE"
+            echo "exit_code=14" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Capture stdout and stderr separately. Never echo env vars.
           # Wrap with `timeout` at the shell level so we keep control of the
           # exit code; 124 means the grader was killed for running too long.
@@ -157,6 +169,7 @@ jobs:
             "11")  FAILCLASS="Missing deliverables/session-log.jsonl at repo root. Did you run ./submit.sh?" ;;
             "12")  FAILCLASS="Dependency install timed out (>180s)." ;;
             "13")  FAILCLASS="Dependency install failed — check pip output below." ;;
+            "14")  FAILCLASS="Deliverable (deliverables/process-map.md) is empty or near-empty (<500 bytes). Nothing to grade." ;;
             "124") FAILCLASS="Grader timed out (exceeded 450s wall clock)." ;;
             *)     FAILCLASS="Grader exited with unexpected code ${EXIT_CODE}." ;;
           esac

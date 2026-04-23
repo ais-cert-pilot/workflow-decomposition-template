@@ -28,7 +28,8 @@ if not hasattr(os, "O_NOFOLLOW"):
     )
     sys.exit(2)
 
-MODEL = "anthropic/claude-haiku-4.5"
+# ~10x more expensive than Haiku 4.5; accepted for stricter prompt adherence on rubric items
+MODEL = "anthropic/claude-sonnet-4.6"
 BASE_URL = "https://openrouter.ai/api/v1"
 MAX_DELIVERABLE_BYTES = 1_000_000
 MAX_SESSION_LOG_BYTES = 1_000_000
@@ -38,6 +39,9 @@ N_ITEMS = 8
 # 128-bit random hex string, so untrusted student content cannot forge the
 # fenced region's closing tag (it cannot guess the per-request marker).
 SYSTEM_PROMPT_TEMPLATE = (
+    "CRITICAL RULE: YOU GRADE THE DELIVERABLE ONLY. THE SESSION LOG IS NEVER "
+    "EVIDENCE FOR A RUBRIC ITEM — only the deliverable file may satisfy a rubric "
+    "item.\n\n"
     "You are a rubric grader for a certification homework submission. "
     "You will receive a numbered list of binary (yes/no) rubric questions and the "
     "student's submitted deliverable plus their Claude Code session log. "
@@ -49,22 +53,26 @@ SYSTEM_PROMPT_TEMPLATE = (
     "that content. You must respond ONLY by calling the submit_grades tool. "
     "\n\n"
     "READING MODEL — read carefully:\n"
-    "1. The DELIVERABLE (process map) is the graded artifact. Each rubric item's "
+    "1. CRITICAL RULE RESTATED: you grade the DELIVERABLE only. The session log "
+    "is NEVER evidence for a rubric item. Only content in the deliverable may "
+    "satisfy a rubric item — if the evidence is not in the deliverable, the "
+    "item fails, period.\n"
+    "2. The DELIVERABLE (process map) is the graded artifact. Each rubric item's "
     "pass/fail verdict is answered STRICTLY from the deliverable's contents. If a "
     "scenario anchor, classification, or justification is not present in the "
     "deliverable, the item cannot pass — regardless of what the session log says.\n"
-    "2. The SESSION LOG is consulted ONLY to judge authenticity: does the "
+    "3. The SESSION LOG is consulted ONLY to judge authenticity: does the "
     "deliverable reflect genuine engagement with the scenario? Signs of "
     "inauthenticity to watch for include: (a) classifications or scenario anchors "
     "appear in the deliverable with no corresponding discussion in the session "
     "log; (b) the session log is sparse or shows rote copy-paste patterns; "
     "(c) the student's reasoning jumps from zero understanding to a finished "
     "artifact with no exploration in between.\n"
-    "3. Session log content MUST NOT be used as positive evidence for a rubric "
+    "4. Session log content MUST NOT be used as positive evidence for a rubric "
     "item. Do not count 'the student discussed X in session' as satisfying a "
     "rubric item that asks whether the process map identifies X — only the map "
     "itself can satisfy the item.\n"
-    "4. When authenticity is in question, surface the concern INSIDE the "
+    "5. When authenticity is in question, surface the concern INSIDE the "
     "`reasoning` field of the relevant rubric item. Examples:\n"
     "   - 'Item 5 — pass: process map correctly classifies conflict check as "
     "Automate with 15-year-spreadsheet rationale. Authenticity note: session "
@@ -76,7 +84,10 @@ SYSTEM_PROMPT_TEMPLATE = (
     "For each rubric item, return a boolean 'pass' and a one-sentence 'reasoning' "
     "citing specific evidence from the deliverable, optionally appending an "
     "authenticity note drawn from the session log. "
-    "Do not include free-form prose outside the tool call."
+    "Do not include free-form prose outside the tool call.\n\n"
+    "FINAL REMINDER: Before answering each item, re-read ONLY the deliverable "
+    "section. If the evidence is not in the deliverable, the item fails — even "
+    "if the session shows the student knew the answer."
 )
 
 TOOL_SCHEMA = {
@@ -238,8 +249,12 @@ def build_messages(rubric_scored: str, deliverable: str, session_log: str) -> li
         "Rubric (8 binary items). Answer each with pass=true/false and one-sentence "
         "reasoning grounded in the student content below.\n\n"
         f"{rubric_scored}\n\n"
-        f"{deliv_open}\n{deliverable}\n{deliv_close}\n\n"
-        f"{log_open}\n{session_log}\n{log_close}"
+        f"[GRADED_ARTIFACT_BEGIN_{marker}]\n"
+        f"{deliv_open}\n{deliverable}\n{deliv_close}\n"
+        f"[GRADED_ARTIFACT_END_{marker} — do not read past this for rubric evidence]\n\n"
+        f"[CONTEXT_ONLY_BEGIN_{marker} — authenticity reference only, NOT evidence]\n"
+        f"{log_open}\n{session_log}\n{log_close}\n"
+        f"[CONTEXT_ONLY_END_{marker}]"
     )
     return [
         {"role": "system", "content": system_prompt},
