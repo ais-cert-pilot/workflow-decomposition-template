@@ -85,6 +85,25 @@ SYSTEM_PROMPT_TEMPLATE = (
     "citing specific evidence from the deliverable, optionally appending an "
     "authenticity note drawn from the session log. "
     "Do not include free-form prose outside the tool call.\n\n"
+    "Authenticity assessment. In ADDITION to per-item grading, return an overall "
+    "`authenticity` judgment based ONLY on the session log. Choose one verdict:\n"
+    "- clean — the session log shows genuine engagement: the student asked "
+    "questions, explored the scenario, iterated on the deliverable, reasoned "
+    "about tradeoffs. The deliverable reflects work that unfolds in the session.\n"
+    "- suspicious — the session log raises concerns: very short/sparse, rote "
+    "pasting, jumps from zero understanding to a finished artifact with no "
+    "exploration, discusses a different problem than the deliverable, or shows "
+    "classifications being adopted without thinking.\n"
+    "- likely_cheating — the session log has almost no relevant engagement with "
+    "the assignment, OR the deliverable contains substantive content "
+    "(classifications, scenario anchors, specific reasoning) that has no "
+    "antecedent or exploration in the session at all.\n"
+    "Write 2-4 sentences in `commentary` citing specific observations from the "
+    "session log (e.g., 'student spent 3 turns on scenario reading before "
+    "attempting classifications', or 'no discussion of the 15-year spreadsheet "
+    "appears anywhere in the session despite it being the deliverable's central "
+    "justification'). Do NOT include direct quotes that would leak rubric items "
+    "or private thinking.\n\n"
     "FINAL REMINDER: Before answering each item, re-read ONLY the deliverable "
     "section. If the evidence is not in the deliverable, the item fails — even "
     "if the session shows the student knew the answer."
@@ -113,9 +132,18 @@ TOOL_SCHEMA = {
                         "required": ["id", "question", "pass", "reasoning"],
                         "additionalProperties": False,
                     },
-                }
+                },
+                "authenticity": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": {"type": "string", "enum": ["clean", "suspicious", "likely_cheating"]},
+                        "commentary": {"type": "string"},
+                    },
+                    "required": ["verdict", "commentary"],
+                    "additionalProperties": False,
+                },
             },
-            "required": ["items"],
+            "required": ["items", "authenticity"],
             "additionalProperties": False,
         },
     },
@@ -290,7 +318,11 @@ def call_model(api_key: str, messages: list[dict[str, str]]) -> dict[str, Any]:
         die(f"tool arguments are not parseable JSON: {type(e).__name__}", 3)
 
 
-def validate_result(payload: Any) -> list[dict[str, Any]]:
+ALLOWED_AUTH_VERDICTS = ("clean", "suspicious", "likely_cheating")
+MAX_AUTH_COMMENTARY_CHARS = 1000
+
+
+def validate_result(payload: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
     if not isinstance(payload, dict):
         die(f"tool arguments must be an object, got {type(payload).__name__}", 3)
     items = payload.get("items")
@@ -317,13 +349,36 @@ def validate_result(payload: Any) -> list[dict[str, Any]]:
     if seen != set(range(1, N_ITEMS + 1)):
         die(f"item ids must be exactly {{1..{N_ITEMS}}}, got {sorted(seen)}", 3)
     clean.sort(key=lambda x: x["id"])
-    return clean
+
+    auth = payload.get("authenticity")
+    if not isinstance(auth, dict):
+        die("'authenticity' must be an object", 3)
+    auth_keys = set(auth.keys())
+    if auth_keys != {"verdict", "commentary"}:
+        die(f"'authenticity' must have exactly keys verdict,commentary; got {sorted(auth_keys)}", 3)
+    verdict = auth.get("verdict")
+    commentary = auth.get("commentary")
+    if not isinstance(verdict, str) or verdict not in ALLOWED_AUTH_VERDICTS:
+        die(f"'authenticity.verdict' must be one of {ALLOWED_AUTH_VERDICTS}", 3)
+    if not isinstance(commentary, str) or not commentary.strip():
+        die("'authenticity.commentary' must be a non-empty string", 3)
+    if len(commentary) > MAX_AUTH_COMMENTARY_CHARS:
+        # Friendlier than rejecting: truncate and annotate.
+        commentary = commentary[: MAX_AUTH_COMMENTARY_CHARS - 15].rstrip() + " …[truncated]"
+    authenticity = {"verdict": verdict, "commentary": commentary}
+    return clean, authenticity
 
 
-def format_output(items: list[dict[str, Any]]) -> str:
+def format_output(items: list[dict[str, Any]], authenticity: dict[str, str]) -> str:
     score = sum(1 for it in items if it["pass"])
     return json.dumps(
-        {"pass": (score / N_ITEMS) >= 0.75, "score": score, "total": N_ITEMS, "items": items},
+        {
+            "pass": (score / N_ITEMS) >= 0.75,
+            "score": score,
+            "total": N_ITEMS,
+            "items": items,
+            "authenticity": authenticity,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -343,8 +398,8 @@ def main() -> None:
     session_log = load_session_log(args.session_log)
 
     payload = call_model(api_key, build_messages(rubric_scored, deliverable, session_log))
-    items = validate_result(payload)
-    sys.stdout.write(format_output(items) + "\n")
+    items, authenticity = validate_result(payload)
+    sys.stdout.write(format_output(items, authenticity) + "\n")
 
 
 if __name__ == "__main__":
