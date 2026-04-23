@@ -181,7 +181,7 @@ jobs:
           if [ "${EXIT_CODE}" = "0" ] && [ -s "$STDOUT_FILE" ]; then
             if jq -e '
                   type == "object"
-                  and ((keys_unsorted | sort) == ["items","pass","score","total"])
+                  and ((keys_unsorted | sort) == ["authenticity","items","pass","score","total"])
                   and (.pass  | type == "boolean")
                   and (.score | (type == "number") and (. == (. | floor)))
                   and (.total | (type == "number") and (. == (. | floor)))
@@ -201,6 +201,10 @@ jobs:
                   and ((.items | map(.id) | sort) == [1,2,3,4,5,6,7,8])
                   and (.score == ([.items[] | select(.pass == true)] | length))
                   and (.pass == (.score >= 6))
+                  and (.authenticity | type == "object")
+                  and ((.authenticity | keys_unsorted | sort) == ["commentary","verdict"])
+                  and (.authenticity.verdict    | (type == "string") and (. == "clean" or . == "suspicious" or . == "likely_cheating"))
+                  and (.authenticity.commentary | (type == "string") and test("\\S"))
                 ' "$STDOUT_FILE" >/dev/null 2>&1; then
               SCHEMA_OK=1
             fi
@@ -210,6 +214,11 @@ jobs:
             PASS=$(jq -r '.pass'  "$STDOUT_FILE")
             SCORE=$(jq -r '.score' "$STDOUT_FILE")
             TOTAL=$(jq -r '.total' "$STDOUT_FILE")
+            JSON=$(cat "$STDOUT_FILE")
+            AUTH_VERDICT=$(printf '%s' "$JSON" | jq -r '.authenticity.verdict')
+            AUTH_COMMENTARY=$(printf '%s' "$JSON" | jq -r '.authenticity.commentary')
+            # UTF-8-safe truncation at 1000 chars (same truncator used elsewhere).
+            AUTH_COMMENTARY=$(python3 -c 'import sys; s=open(0, encoding="utf-8", errors="replace").read().rstrip("\n"); sys.stdout.write(s if len(s) <= 1000 else s[:985].rstrip() + " …[truncated]")' <<<"$AUTH_COMMENTARY")
             # Truncate each reasoning to 600 chars before rendering.
             ITEMS_MD=$(jq -r '
                 (.items // [])
@@ -233,11 +242,12 @@ jobs:
               VERDICT="fail"
             fi
             TITLE="Score: ${SCORE}/${TOTAL} — ${VERDICT}"
-            SUMMARY="${SCORE}/${TOTAL} — ${VERDICT}"
+            SUMMARY="${SCORE}/${TOTAL} — ${VERDICT} · authenticity: ${AUTH_VERDICT}"
+            AUTH_BLOCK=$(printf '## Authenticity: %s\n\n%s\n\n## Rubric items\n\n' "$AUTH_VERDICT" "$AUTH_COMMENTARY")
             if [ -z "$ITEMS_MD" ]; then
-              TEXT="_(grader returned zero rubric items)_"
+              TEXT="${AUTH_BLOCK}_(grader returned zero rubric items)_"
             else
-              TEXT="$ITEMS_MD"
+              TEXT="${AUTH_BLOCK}${ITEMS_MD}"
             fi
           elif [ "${EXIT_CODE}" = "0" ]; then
             # Grader exited 0 but stdout did not match the expected schema;
